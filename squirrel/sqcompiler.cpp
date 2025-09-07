@@ -423,6 +423,12 @@ public:
             case TK_MULEQ:
             case TK_DIVEQ:
             case TK_MODEQ:
+            case TK_OREQ:
+            case TK_ANDEQ:
+            case TK_SHIFTLEQ:
+            case TK_SHIFTREQ:
+            case TK_USHIFTREQ:
+            case TK_XOREQ:
                 EmitCompoundArith(op, ds, pos);
                 break;
             }
@@ -588,6 +594,12 @@ public:
         case TK_MULEQ: oper = '*'; break;
         case TK_DIVEQ: oper = '/'; break;
         case TK_MODEQ: oper = '%'; break;
+        case TK_OREQ: oper = '|'; break;
+        case TK_ANDEQ: oper = '&'; break;
+        case TK_SHIFTLEQ: oper = '<'; break;
+        case TK_SHIFTREQ: oper = '>'; break;
+        case TK_USHIFTREQ: oper = '$'; break;
+        case TK_XOREQ: oper = '^'; break;
         default: oper = 0; //shut up compiler
             assert(0); break;
         };
