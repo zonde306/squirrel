@@ -1188,6 +1188,76 @@ static SQInteger array_rfind(HSQUIRRELVM v)
     return _array_find_helper(v, false);
 }
 
+// Unified helper for first() and last() that reuses find()/rfind()
+static SQInteger _array_first_last_helper(HSQUIRRELVM v, bool is_first)
+{
+    // This function calls the array's own find() or rfind() method,
+    // gets the index, and then returns the element at that index.
+
+    SQArray* a = _array(stack_get(v, 1)); // The 'this' array
+    SQInteger top = sq_gettop(v);
+
+    // 1. Get the appropriate find function ("find" or "rfind") from the array's delegate
+    const SQChar* find_func_name = is_first ? _SC("find") : _SC("rfind");
+    sq_pushstring(v, find_func_name, -1);
+
+    if(SQ_FAILED(sq_get(v, 1)))
+    { // Get method from the array at index 1
+        return sq_throwerror(v, _SC("internal error: find/rfind method not found on array delegate"));
+    }
+    // Stack top is now the find/rfind closure.
+
+    // 2. Prepare and execute the call to find/rfind
+    sq_push(v, 1); // Push 'this' for the call (the array itself)
+    sq_push(v, 2); // Push the argument for the call (the callback)
+
+    if(SQ_FAILED(sq_call(v, 2, SQTrue, SQTrue)))
+    {
+        // Error occurred in the user's callback or in find/rfind
+        return SQ_ERROR;
+    }
+    // The result of the find/rfind call (an index or null) is now on top of the stack.
+
+    // 3. Process the result
+    if(sq_gettype(v, -1) == OT_NULL)
+    {
+        // Not found, find/rfind already returned null. We're done.
+        return 1;
+    }
+
+    // Found. Get the index.
+    SQInteger found_idx;
+    sq_getinteger(v, -1, &found_idx);
+
+    // Check if index is valid (as a safeguard)
+    if(found_idx >= 0 && found_idx < a->Size())
+    {
+        // Pop the index and push the actual element.
+        sq_poptop(v);
+        v->Push(a->_values[found_idx]);
+    }
+    else
+    {
+        // This case should theoretically not happen if find/rfind is correct.
+        // But if it does, return null.
+        sq_poptop(v);
+        sq_pushnull(v);
+    }
+
+    return 1;
+}
+
+// array.first(callable)
+static SQInteger array_first(HSQUIRRELVM v)
+{
+    return _array_first_last_helper(v, true);
+}
+
+// array.last(callable)
+static SQInteger array_last(HSQUIRRELVM v)
+{
+    return _array_first_last_helper(v, false);
+}
 
 static bool _sort_compare(HSQUIRRELVM v, SQArray *arr, SQObjectPtr &a,SQObjectPtr &b,SQInteger func,SQInteger &ret)
 {
@@ -1554,6 +1624,8 @@ const SQRegFunction SQSharedState::_array_default_delegate_funcz[]={
     {_SC("flat"), array_flat, -1, _SC("an")},
     {_SC("flatmap"), array_flatmap, 2, _SC("ac")},
     {_SC("rfind"), array_rfind, 2, _SC("a c|.")},
+    {_SC("first"), array_first, 2, _SC("ac")},
+    {_SC("last"), array_last, 2, _SC("ac")},
     {NULL,(SQFUNCTION)0,0,NULL}
 };
 
