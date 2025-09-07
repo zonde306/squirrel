@@ -701,39 +701,64 @@ static SQInteger table_map(HSQUIRRELVM v)
 	return 1;
 }
 
-// table.toarray() [Corrected Version]
+// table.toarray()
+// Converts a table to an array of [key, value] pairs.
+// e.g., {a=1, b=2} becomes [["a", 1], ["b", 2]]
 static SQInteger table_toarray(HSQUIRRELVM v)
 {
+    // Stack at start: [1: table_obj]
     sq_newarray(v, 0); // Result array is at stack index 2
+    // Stack: [1: table_obj], [2: result_array]
 
-    sq_push(v, 1);     // Push the table for iteration
-    sq_pushnull(v);    // Start iteration
+    // We will use the absolute index 2 to refer to the result_array, which is safer.
+    const SQInteger result_array_idx = 2;
+
+    // Prepare for iteration
+    sq_push(v, 1);     // Push the table to iterate over (at index 3)
+    sq_pushnull(v);    // Push iterator placeholder (at index 4)
+    // Stack: [1: table_obj], [2: result_array], [3: table_for_iter], [4: null_iterator]
+
     while(SQ_SUCCEEDED(sq_next(v, -2)))
     {
-        // Stack: ..., result_array, table, iterator, key, value
+        // sq_next replaces null with iterator, and pushes key and value.
+        // Stack: [1: table_obj], [2: result_array], [3: table_for_iter], [4: iterator], [5: key], [6: value]
 
-        sq_newarray(v, 2); // Create a [key, value] pair array
-        // Stack: ..., key, value, pair_array
+        // Create a new [key, value] pair array
+        sq_newarray(v, 0); // pair_array is now at the top of the stack (index 7)
+        // Stack: ..., [4: iterator], [5: key], [6: value], [7: pair_array]
 
-        // Set key at index 0
-        sq_pushinteger(v, 0);   // Push key for the pair_array (index 0)
-        sq_push(v, -4);         // Push value for the pair_array (the original key)
-        sq_set(v, -3);          // Set pair_array[0] = original_key
+        // Append the key to the pair_array.
+        // The key is at index 5, which is relative index -3 from the top.
+        sq_push(v, -3);         // Push a copy of the key
+        sq_arrayappend(v, -2);  // Append the key copy to pair_array, pops the copy.
+        // Stack: ..., [4: iterator], [5: key], [6: value], [7: pair_array_with_key]
 
-        // Set value at index 1
-        sq_pushinteger(v, 1);   // Push key for the pair_array (index 1)
-        sq_push(v, -3);         // Push value for the pair_array (the original value)
-        sq_set(v, -3);          // Set pair_array[1] = original_value
+        // Append the value to the pair_array.
+        // The value is at index 6, which is relative index -2 from the top.
+        sq_push(v, -2);         // Push a copy of the value
+        sq_arrayappend(v, -2);  // Append the value copy to pair_array, pops the copy.
+        // Stack: ..., [4: iterator], [5: key], [6: value], [7: pair_array_complete]
 
-        // Append the new pair_array to the main result_array
-        // sq_arrayappend pops the pair_array
-        sq_arrayappend(v, -5);
+        // Now, append the completed pair_array to the main result_array.
+        // result_array is at absolute index 2.
+        sq_arrayappend(v, result_array_idx); // This pops the pair_array from the top.
+        // Stack: ..., [4: iterator], [5: key], [6: value]
 
-        sq_pop(v, 2); // Pop original key and value
+        // Pop the original key and value to prepare for the next iteration.
+        sq_pop(v, 2);
+        // Stack: [1: table_obj], [2: result_array], [3: table_for_iter], [4: iterator]
     }
-    sq_pop(v, 1); // Pop iterator
 
-    return 1;
+    // Clean up after the loop finishes.
+    // The table used for iteration and the final iterator state are left on the stack.
+    sq_pop(v, 2); // Pop table_for_iter and iterator
+    // Stack: [1: table_obj], [2: result_array]
+
+    // The result_array is already in the correct position on the stack (just below the top).
+    // To return it, we need to make it the top-most element.
+    sq_push(v, result_array_idx); // Push a reference to the result array to the top
+
+    return 1; // Return the new array at the top of the stack.
 }
 
 // table.fromarray(array_of_pairs) - static method for the table delegate
