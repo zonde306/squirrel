@@ -382,7 +382,14 @@ public:
         case TK_PLUSEQ:
         case TK_MULEQ:
         case TK_DIVEQ:
-        case TK_MODEQ:{
+        case TK_MODEQ:
+        case TK_OREQ:
+        case TK_ANDEQ:
+        case TK_SHIFTLEQ:
+        case TK_SHIFTREQ:
+        case TK_USHIFTREQ:
+        case TK_XOREQ:
+        {
             SQInteger op = _token;
             SQInteger ds = _es.etype;
             SQInteger pos = _es.epos;
@@ -927,6 +934,7 @@ public:
         switch(_token) {
         case _SC('='): case _SC('('): case TK_NEWSLOT: case TK_MODEQ: case TK_MULEQ:
         case TK_DIVEQ: case TK_MINUSEQ: case TK_PLUSEQ:
+        case TK_OREQ: case TK_ANDEQ: case TK_XOREQ: case TK_SHIFTLEQ: case TK_SHIFTREQ: case TK_USHIFTREQ:
             return false;
         case TK_PLUSPLUS: case TK_MINUSMINUS:
             if (!IsEndOfStatement()) {

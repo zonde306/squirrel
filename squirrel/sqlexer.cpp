@@ -176,22 +176,59 @@ SQInteger SQLexer::Lex()
                 RETURN_TOKEN(TK_LE)
                 break;
             case _SC('-'): NEXT(); RETURN_TOKEN(TK_NEWSLOT); break;
-            case _SC('<'): NEXT(); RETURN_TOKEN(TK_SHIFTL); break;
+            case _SC('<'):
+            {
+                NEXT();
+                if(CUR_CHAR == _SC('='))
+                {
+                    NEXT();
+                    RETURN_TOKEN(TK_SHIFTLEQ);
+                }
+                else
+                {
+                    RETURN_TOKEN(TK_SHIFTL);
+                }
+                break;
+            }
             case _SC('/'): NEXT(); RETURN_TOKEN(TK_ATTR_OPEN); break;
             }
             RETURN_TOKEN('<');
         case _SC('>'):
             NEXT();
-            if (CUR_CHAR == _SC('=')){ NEXT(); RETURN_TOKEN(TK_GE);}
-            else if(CUR_CHAR == _SC('>')){
-                NEXT();
-                if(CUR_CHAR == _SC('>')){
-                    NEXT();
-                    RETURN_TOKEN(TK_USHIFTR);
-                }
-                RETURN_TOKEN(TK_SHIFTR);
+            if(CUR_CHAR == _SC('='))
+            {
+                NEXT(); RETURN_TOKEN(TK_GE);
             }
-            else { RETURN_TOKEN('>') }
+            else if(CUR_CHAR == _SC('>'))
+            {
+                NEXT();
+                if(CUR_CHAR == _SC('>'))
+                {
+                    NEXT();
+                    if(CUR_CHAR == _SC('='))
+                    {
+                        NEXT();
+                        RETURN_TOKEN(TK_USHIFTREQ);
+                    }
+                    else
+                    {
+                        RETURN_TOKEN(TK_USHIFTR);
+                    }
+                }
+                if(CUR_CHAR == _SC('='))
+                {
+                    NEXT();
+                    RETURN_TOKEN(TK_SHIFTREQ);
+                }
+                else
+                {
+                    RETURN_TOKEN(TK_SHIFTR);
+                }
+            }
+            else
+            {
+                RETURN_TOKEN('>')
+            }
         case _SC('!'):
             NEXT();
             if (CUR_CHAR != _SC('=')){ RETURN_TOKEN('!')}
@@ -217,8 +254,18 @@ SQInteger SQLexer::Lex()
             }
         case _SC('{'): case _SC('}'): case _SC('('): case _SC(')'): case _SC('['): case _SC(']'):
         case _SC(';'): case _SC(','): case _SC('?'): case _SC('^'): case _SC('~'):
-            {SQInteger ret = CUR_CHAR;
-            NEXT(); RETURN_TOKEN(ret); }
+        {
+            SQInteger ret = CUR_CHAR;
+            NEXT();
+            if(ret == '^' && CUR_CHAR == _SC('='))
+            {
+                NEXT(); RETURN_TOKEN(TK_XOREQ);
+            }
+            else
+            {
+                RETURN_TOKEN(ret);
+            }
+        }
         case _SC('.'):
             NEXT();
             if (CUR_CHAR != _SC('.')){ RETURN_TOKEN('.') }
@@ -228,12 +275,32 @@ SQInteger SQLexer::Lex()
             RETURN_TOKEN(TK_VARPARAMS);
         case _SC('&'):
             NEXT();
-            if (CUR_CHAR != _SC('&')){ RETURN_TOKEN('&') }
-            else { NEXT(); RETURN_TOKEN(TK_AND); }
+            if(CUR_CHAR == _SC('='))
+            {
+                NEXT(); RETURN_TOKEN(TK_ANDEQ);
+            }
+            else if(CUR_CHAR != _SC('&'))
+            {
+                RETURN_TOKEN('&')
+            }
+            else
+            {
+                NEXT(); RETURN_TOKEN(TK_AND);
+            }
         case _SC('|'):
             NEXT();
-            if (CUR_CHAR != _SC('|')){ RETURN_TOKEN('|') }
-            else { NEXT(); RETURN_TOKEN(TK_OR); }
+            if(CUR_CHAR == _SC('='))
+            {
+                NEXT(); RETURN_TOKEN(TK_OREQ);
+            }
+            else if(CUR_CHAR != _SC('|'))
+            {
+                RETURN_TOKEN('|')
+            }
+            else
+            {
+                NEXT(); RETURN_TOKEN(TK_OR);
+            }
         case _SC(':'):
             NEXT();
             if (CUR_CHAR != _SC(':')){ RETURN_TOKEN(':') }
