@@ -102,6 +102,14 @@ bool SQVM::ARITH_OP(SQUnsignedInteger op,SQObjectPtr &trg,const SQObjectPtr &o1,
             }
             trg = res; }
             break;
+        case OT_ARRAY:
+            if(op == '+')
+            {
+                SQArray* arr = _array(o1)->Clone();
+                arr->Extend(_array(o2));
+                trg = arr;
+            }
+            break;
         default:
             if(op == '+' && (tmask & _RT_STRING)){
                 if(!StringCat(o1, o2, trg)) return false;
