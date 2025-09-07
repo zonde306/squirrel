@@ -23,8 +23,9 @@ public:
     void Finalize(){
         _values.resize(0);
     }
-    bool Get(const SQInteger nidx,SQObjectPtr &val)
+    bool Get(SQInteger nidx,SQObjectPtr &val)
     {
+        if(nidx < 0) nidx += (SQInteger)_values.size();
         if(nidx>=0 && nidx<(SQInteger)_values.size()){
             SQObjectPtr &o = _values[nidx];
             val = _realval(o);
