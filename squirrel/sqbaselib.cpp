@@ -2092,33 +2092,47 @@ static SQInteger string_join(HSQUIRRELVM v)
     return 1;
 }
 
-// Helper to convert string to integer for format key
+// Helper function to convert a substring to an integer.
+// It's good practice to have this as a standalone helper.
 static bool _string_to_sqinteger(const SQChar* s, SQInteger len, SQInteger* out)
 {
-    if(len == 0) return false;
+    if(len <= 0) return false;
     SQInteger res = 0;
-    for(SQInteger i = 0; i < len; ++i)
+    SQInteger sign = 1;
+    SQInteger i = 0;
+    if(s[0] == '-')
     {
-        if(!scisdigit(s[i])) return false;
+        sign = -1;
+        i++;
+    }
+    for(; i < len; ++i)
+    {
+        if(s[i] < '0' || s[i] > '9') return false; // Not a digit
         res = res * 10 + (s[i] - '0');
     }
-    *out = res;
+    *out = res * sign;
     return true;
 }
+
 
 // str.format(...)
 static SQInteger string_format(HSQUIRRELVM v)
 {
     const SQChar* fmt_str;
-    sq_getstring(v, 1, &fmt_str);
+    if(SQ_FAILED(sq_getstring(v, 1, &fmt_str)))
+    {
+        return sq_throwerror(v, _SC("could not get format string"));
+    }
     SQInteger fmt_len = sq_getsize(v, 1);
     SQInteger top = sq_gettop(v);
 
     // Determine argument mode: positional or named (table)
     bool named_mode = (top == 2 && sq_gettype(v, 2) == OT_TABLE);
 
-    // --- Pass 1: Calculate total length ---
-    SQInteger total_len = 0;
+    // Use std::string as a safe, single-pass string builder.
+    std::string result;
+    result.reserve(fmt_len * 2); // Pre-allocate a reasonable buffer
+
     SQInteger auto_arg_idx = 2; // Stack index for automatic {}
 
     for(SQInteger i = 0; i < fmt_len; ++i)
@@ -2127,7 +2141,7 @@ static SQInteger string_format(HSQUIRRELVM v)
         {
             if(i + 1 < fmt_len && fmt_str[i + 1] == '{')
             { // Escaped {{
-                total_len++;
+                result.push_back('{');
                 i++;
                 continue;
             }
@@ -2145,13 +2159,17 @@ static SQInteger string_format(HSQUIRRELVM v)
 
             SQInteger key_len = key_end - key_start;
 
+            // -- Safely get the argument and convert it to a string --
+            SQInteger initial_stack_top = sq_gettop(v);
+
             if(named_mode)
             {
                 sq_push(v, 2); // Push the table
                 sq_pushstring(v, fmt_str + key_start, key_len);
                 if(SQ_FAILED(sq_get(v, -2)))
                 {
-                    sq_pop(v, 1); // Pop table
+                    // Clean up the table from the stack before erroring
+                    sq_settop(v, initial_stack_top);
                     return sq_throwerror(v, _SC("key not found in format table"));
                 }
             }
@@ -2167,7 +2185,7 @@ static SQInteger string_format(HSQUIRRELVM v)
                     SQInteger n;
                     if(!_string_to_sqinteger(fmt_str + key_start, key_len, &n))
                     {
-                        return sq_throwerror(v, _SC("invalid format key (must be a number for positional args)"));
+                        return sq_throwerror(v, _SC("invalid format key (must be a number)"));
                     }
                     arg_idx = n + 2; // Convert 0-based index to stack index
                 }
@@ -2179,20 +2197,31 @@ static SQInteger string_format(HSQUIRRELVM v)
                 sq_push(v, arg_idx);
             }
 
+            // Now the value to be formatted is at the top of the stack.
+            // Convert it to a string (in-place replacement).
             if(SQ_FAILED(sq_tostring(v, -1)))
             {
-                // error is already set by sq_tostring
+                // The error is already on the stack. sq_tostring pops the original value
+                // and pushes the error, so we don't need to clean up further.
                 return SQ_ERROR;
             }
-            total_len += sq_getsize(v, -1);
-            sq_pop(v, (named_mode ? 2 : 1)); // Pop string and maybe table
+
+            const SQChar* val_str;
+            SQInteger val_len;
+            sq_getstring(v, -1, &val_str);
+            val_len = sq_getsize(v, -1);
+            result.append(val_str, val_len);
+
+            // Clean up the stack to its state before we pushed args for this placeholder.
+            sq_settop(v, initial_stack_top);
+
             i = key_end; // Move parser past the '}'
         }
         else if(fmt_str[i] == '}')
         {
             if(i + 1 < fmt_len && fmt_str[i + 1] == '}')
             { // Escaped }}
-                total_len++;
+                result.push_back('}');
                 i++;
                 continue;
             }
@@ -2200,87 +2229,12 @@ static SQInteger string_format(HSQUIRRELVM v)
         }
         else
         {
-            total_len++;
+            result.push_back(fmt_str[i]);
         }
     }
 
-    // --- Pass 2: Build the final string ---
-    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(total_len));
-    SQChar* dest = snew;
-    auto_arg_idx = 2; // Reset for second pass
-
-    for(SQInteger i = 0; i < fmt_len; ++i)
-    {
-        if(fmt_str[i] == '{')
-        {
-            if(i + 1 < fmt_len && fmt_str[i + 1] == '{')
-            { // Escaped {{
-                *dest++ = '{';
-                i++;
-                continue;
-            }
-
-            SQInteger key_start = i + 1;
-            SQInteger key_end = key_start;
-            while(key_end < fmt_len && fmt_str[key_end] != '}')
-            {
-                key_end++;
-            }
-
-            SQInteger key_len = key_end - key_start;
-
-            // Get value again
-            if(named_mode)
-            {
-                sq_push(v, 2);
-                sq_pushstring(v, fmt_str + key_start, key_len);
-                sq_get(v, -2);
-            }
-            else
-            {
-                SQInteger arg_idx = -1;
-                if(key_len == 0)
-                {
-                    arg_idx = auto_arg_idx++;
-                }
-                else
-                {
-                    SQInteger n;
-                    _string_to_sqinteger(fmt_str + key_start, key_len, &n);
-                    arg_idx = n + 2;
-                }
-                sq_push(v, arg_idx);
-            }
-
-            sq_tostring(v, -1);
-            const SQChar* val_str;
-            sq_getstring(v, -1, &val_str);
-            SQInteger val_len = sq_getsize(v, -1);
-
-            memcpy(dest, val_str, sq_rsl(val_len));
-            dest += val_len;
-
-            sq_pop(v, (named_mode ? 2 : 1));
-            i = key_end;
-        }
-        else if(fmt_str[i] == '}')
-        {
-            if(i + 1 < fmt_len && fmt_str[i + 1] == '}')
-            { // Escaped }}
-                *dest++ = '}';
-                i++;
-                continue;
-            }
-            // This case should not be reached due to pass 1 check, but as a safeguard:
-            *dest++ = fmt_str[i];
-        }
-        else
-        {
-            *dest++ = fmt_str[i];
-        }
-    }
-
-    v->Push(SQString::Create(_ss(v), snew, total_len));
+    // Push the final, formatted string onto the stack as the return value.
+    sq_pushstring(v, result.c_str(), result.length());
     return 1;
 }
 
