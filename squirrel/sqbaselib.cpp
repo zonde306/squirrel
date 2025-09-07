@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <string>
+#include <vector>
+#include <utility>
 
 static bool str2num(const SQChar *s,SQObjectPtr &res,SQInteger base)
 {
@@ -405,22 +408,17 @@ static SQInteger default_delegate_tostring(HSQUIRRELVM v)
     return 1;
 }
 
-// Forward declaration
-static SQRESULT pretty_tostring_recursive(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx);
-
-// Helper for correct object identity comparison.
+// Helpers (obj_is_identical, is_in_recursion_detector, get_string_repr) remain unchanged.
 static bool obj_is_identical(const SQObjectPtr& o1, const SQObjectPtr& o2)
 {
     if(o1._type != o2._type) return false;
-    // For ref-counted types, comparing pointers is sufficient for identity.
-    // For primitives, comparing raw value is also correct.
     return o1._unVal.raw == o2._unVal.raw;
 }
 
-// Helper to check if an object is already in the recursion detector array
 static bool is_in_recursion_detector(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx)
 {
-    SQObjectPtr& obj = stack_get(v, obj_idx);
+    SQInteger abs_obj_idx = (obj_idx < 0) ? sq_gettop(v) + obj_idx + 1 : obj_idx;
+    SQObjectPtr& obj = stack_get(v, abs_obj_idx);
     SQArray* detector = _array(stack_get(v, recursion_detector_idx));
     SQInteger size = detector->Size();
     for(SQInteger i = 0; i < size; ++i)
@@ -433,129 +431,37 @@ static bool is_in_recursion_detector(HSQUIRRELVM v, SQInteger obj_idx, SQInteger
     return false;
 }
 
-// Helper to generate a 'repr'-like string with quotes and escapes
-static void string_repr(HSQUIRRELVM v, const SQChar* str, SQInteger len)
+static void get_string_repr(const SQChar* str, SQInteger len, std::string& out)
 {
-    // Estimate new length
-    SQInteger new_len_estimate = len + 2;
-    for(SQInteger i = 0; i < len; ++i)
-    {
-        switch(str[i])
-        {
-            case '\"': case '\\': case '\n': case '\r': case '\t':
-                new_len_estimate++; break;
-        }
-    }
-
-    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(new_len_estimate));
-    SQChar* dest = snew;
-    *dest++ = '\"';
+    out.reserve(out.size() + len + 2);
+    out.push_back('\"');
     for(SQInteger i = 0; i < len; ++i)
     {
         SQChar c = str[i];
         switch(c)
         {
-            case '\"': *dest++ = '\\'; *dest++ = '\"'; break;
-            case '\\': *dest++ = '\\'; *dest++ = '\\'; break;
-            case '\n': *dest++ = '\\'; *dest++ = 'n'; break;
-            case '\r': *dest++ = '\\'; *dest++ = 'r'; break;
-            case '\t': *dest++ = '\\'; *dest++ = 't'; break;
-            default: *dest++ = c; break;
+            case '\"': out.append("\\\""); break;
+            case '\\': out.append("\\\\"); break;
+            case '\n': out.append("\\n"); break;
+            case '\r': out.append("\\r"); break;
+            case '\t': out.append("\\t"); break;
+            default:   out.push_back(c); break;
         }
     }
-    *dest++ = '\"';
-    v->Push(SQString::Create(_ss(v), snew, dest - snew));
+    out.push_back('\"');
 }
 
-// A single function to build the final string for arrays and tables
-static SQRESULT build_pretty_string(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx, SQInteger total_len)
+
+// Core recursive pretty-printing function using std::string builder
+static SQRESULT pretty_print_recursive_impl(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx, std::string& out)
 {
-    SQObjectPtr& o = stack_get(v, obj_idx);
-    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(total_len));
-    SQChar* dest = snew;
-    SQInteger top = sq_gettop(v); // Save stack top
-
-    if(sq_type(o) == OT_ARRAY)
-    {
-        *dest++ = '[';
-        SQArray* a = _array(o);
-        SQInteger size = a->Size();
-        for(SQInteger i = 0; i < size; ++i)
-        {
-            v->Push(a->_values[i]);
-            pretty_tostring_recursive(v, sq_gettop(v), recursion_detector_idx);
-
-            const SQChar* part_str;
-            sq_getstring(v, -1, &part_str);
-            SQInteger part_len = sq_getsize(v, -1);
-            memcpy(dest, part_str, sq_rsl(part_len));
-            dest += part_len;
-
-            sq_pop(v, 2); // Pop stringified and original value
-
-            if(i < size - 1)
-            {
-                *dest++ = ','; *dest++ = ' ';
-            }
-        }
-        *dest++ = ']';
-    }
-    else
-    { // Table-like
-        *dest++ = '{';
-        sq_push(v, obj_idx);
-        sq_pushnull(v);
-        bool first = true;
-        while(SQ_SUCCEEDED(sq_next(v, -2)))
-        {
-            // Stack: table, iterator, key, value
-            if(!first)
-            {
-                *dest++ = ','; *dest++ = ' ';
-            }
-            first = false;
-
-            // Key
-            pretty_tostring_recursive(v, sq_gettop(v) - 1, recursion_detector_idx);
-            const SQChar* key_str;
-            sq_getstring(v, -1, &key_str);
-            SQInteger key_len = sq_getsize(v, -1);
-            memcpy(dest, key_str, sq_rsl(key_len));
-            dest += key_len;
-            sq_pop(v, 1);
-
-            *dest++ = ':'; *dest++ = ' ';
-
-            // Value
-            pretty_tostring_recursive(v, sq_gettop(v) - 2, recursion_detector_idx);
-            const SQChar* val_str;
-            sq_getstring(v, -1, &val_str);
-            SQInteger val_len = sq_getsize(v, -1);
-            memcpy(dest, val_str, sq_rsl(val_len));
-            dest += val_len;
-            sq_pop(v, 1);
-
-            sq_pop(v, 2); // Pop original key and val
-        }
-        sq_pop(v, 1); // Pop iterator
-        *dest++ = '}';
-    }
-
-    sq_settop(v, top); // Restore stack
-    v->Push(SQString::Create(_ss(v), snew, total_len));
-    return SQ_OK;
-}
-
-// Core recursive pretty-printing function (two-pass implementation)
-static SQRESULT pretty_tostring_recursive(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx)
-{
-    SQObjectPtr& o = stack_get(v, obj_idx < 0 ? sq_gettop(v) + obj_idx + 1 : obj_idx);
-    SQInteger top = sq_gettop(v);
+    SQInteger abs_obj_idx = (obj_idx < 0) ? sq_gettop(v) + obj_idx + 1 : obj_idx;
+    const SQObjectPtr& o = stack_get(v, abs_obj_idx);
 
     switch(sq_type(o))
     {
         case OT_STRING:
-            string_repr(v, _stringval(o), _string(o)->_len);
+            get_string_repr(_stringval(o), _string(o)->_len, out);
             return SQ_OK;
 
         case OT_ARRAY:
@@ -563,85 +469,114 @@ static SQRESULT pretty_tostring_recursive(HSQUIRRELVM v, SQInteger obj_idx, SQIn
         case OT_INSTANCE:
         case OT_CLASS:
         {
-            if(is_in_recursion_detector(v, obj_idx, recursion_detector_idx))
+            if(is_in_recursion_detector(v, abs_obj_idx, recursion_detector_idx))
             {
-                sq_pushstring(v, (sq_type(o) == OT_ARRAY) ? _SC("[...]") : _SC("{...}"), -1);
+                out.append((sq_type(o) == OT_ARRAY) ? "[...]" : "{...}");
                 return SQ_OK;
             }
 
-            SQInteger size = sq_getsize(v, obj_idx);
+            SQInteger size = sq_getsize(v, abs_obj_idx);
             if(size == 0)
             {
-                sq_pushstring(v, (sq_type(o) == OT_ARRAY) ? _SC("[]") : _SC("{}"), -1);
+                out.append((sq_type(o) == OT_ARRAY) ? "[]" : "{}");
                 return SQ_OK;
             }
 
-            sq_push(v, obj_idx);
+            sq_push(v, abs_obj_idx);
             sq_arrayappend(v, recursion_detector_idx);
 
-            // Pass 1: Calculate Length
-            SQInteger total_len = 2; // For '[' and ']' or '{' and '}'
             if(sq_type(o) == OT_ARRAY)
             {
+                out.push_back('[');
                 SQArray* a = _array(o);
                 for(SQInteger i = 0; i < size; ++i)
                 {
-                    v->Push(a->_values[i]);
-                    if(SQ_FAILED(pretty_tostring_recursive(v, sq_gettop(v), recursion_detector_idx))) return SQ_ERROR;
-                    total_len += sq_getsize(v, -1);
-                    sq_pop(v, 2); // Pop stringified and original value
+                    if(i > 0) out.append(", ");
+
+                    sq_pushobject(v, a->_values[i]);
+                    if(SQ_FAILED(pretty_print_recursive_impl(v, -1, recursion_detector_idx, out))) return SQ_ERROR;
+                    sq_pop(v, 1);
                 }
-                if(size > 1) total_len += (size - 1) * 2; // For ", "
+                out.push_back(']');
             }
-            else
-            { // Table-like
-                sq_push(v, obj_idx);
+            else // Table-like
+            {
+                // --- FIX: Completely new, safe strategy for tables ---
+                // Step 1: Extract all key-value pairs into a C++ vector without any recursive calls.
+                std::vector<std::pair<SQObjectPtr, SQObjectPtr>> kv_pairs;
+                kv_pairs.reserve(size);
+
+                SQInteger initial_top = sq_gettop(v);
+                sq_push(v, abs_obj_idx);
                 sq_pushnull(v);
-                bool first = true;
                 while(SQ_SUCCEEDED(sq_next(v, -2)))
                 {
-                    if(!first) total_len += 2; // ", "
+                    // Stack: ..., table, iterator, key, value
+                    // Safely get the objects without triggering recursion.
+                    SQObjectPtr key = stack_get(v, -2);
+                    SQObjectPtr val = stack_get(v, -1);
+                    kv_pairs.emplace_back(key, val);
+                    sq_pop(v, 2); // Pop key and value for next iteration
+                }
+                sq_settop(v, initial_top); // Restore stack (cleans up table and iterator)
+
+                // Step 2: Now, iterate over the C++ vector and safely perform recursive calls.
+                out.push_back('{');
+                bool first = true;
+                for(const auto& pair : kv_pairs)
+                {
+                    if(!first) out.append(", ");
                     first = false;
 
-                    // Key
-                    if(SQ_FAILED(pretty_tostring_recursive(v, sq_gettop(v) - 1, recursion_detector_idx))) return SQ_ERROR;
-                    total_len += sq_getsize(v, -1) + 2; // ": "
+                    // Process Key
+                    sq_pushobject(v, pair.first);
+                    if(SQ_FAILED(pretty_print_recursive_impl(v, -1, recursion_detector_idx, out))) return SQ_ERROR;
                     sq_pop(v, 1);
 
-                    // Value
-                    if(SQ_FAILED(pretty_tostring_recursive(v, sq_gettop(v) - 2, recursion_detector_idx))) return SQ_ERROR;
-                    total_len += sq_getsize(v, -1);
-                    sq_pop(v, 1);
+                    out.append(": ");
 
-                    sq_pop(v, 2); // Pop original key and value
+                    // Process Value
+                    sq_pushobject(v, pair.second);
+                    if(SQ_FAILED(pretty_print_recursive_impl(v, -1, recursion_detector_idx, out))) return SQ_ERROR;
+                    sq_pop(v, 1);
                 }
-                sq_pop(v, 1); // Pop iterator
+                out.push_back('}');
             }
 
-            // Pass 2: Build String
-            build_pretty_string(v, obj_idx, recursion_detector_idx, total_len);
-
-            sq_arraypop(v, recursion_detector_idx, SQFalse); // Pop self
-            sq_settop(v, top); // Restore stack
-            sq_push(v, top + 1); // Push the result string
-            sq_remove(v, top + 1); // Remove it from its old position
+            sq_arraypop(v, recursion_detector_idx, SQFalse);
             return SQ_OK;
         }
 
         default:
-            return sq_tostring(v, obj_idx);
+        {
+            sq_push(v, abs_obj_idx);
+            sq_tostring(v, -1);
+            const SQChar* s;
+            sq_getstring(v, -1, &s);
+            if(s) out.append(s);
+            sq_pop(v, 1);
+            return SQ_OK;
+        }
     }
 }
 
+// Entry point (pretty_tostring_entry) and Delegate registrations remain unchanged.
 static SQRESULT pretty_tostring_entry(HSQUIRRELVM v)
 {
-    sq_newarray(v, 0); // Create recursion detector
-    SQRESULT res = pretty_tostring_recursive(v, 1, 2);
+    sq_newarray(v, 0);
+
+    std::string result;
+    result.reserve(256);
+
+    SQRESULT res = pretty_print_recursive_impl(v, 1, 2, result);
+
     if(SQ_FAILED(res))
     {
+        sq_remove(v, -2);
         return SQ_ERROR;
     }
-    // Result is on top, recursion detector is below it. Remove detector.
+
+    sq_pushstring(v, result.c_str(), result.length());
     sq_remove(v, -2);
     return 1;
 }
