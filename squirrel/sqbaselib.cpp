@@ -1103,14 +1103,19 @@ static SQInteger _array_find_helper(HSQUIRRELVM v, bool forward)
             SQInteger top = sq_gettop(v);
             sq_push(v, 2); // Push the callable
             sq_push(v, 1); // Push 'this' (the array)
-            sq_pushinteger(v, i);
+
+            // --- MODIFICATION START ---
+            // Only push the value as the single argument.
             v->Push(current_val);
 
-            if(SQ_FAILED(sq_call(v, 3, SQTrue, SQTrue)))
+            // Call with 2 arguments: 1 'this' + 1 regular parameter (the value).
+            if(SQ_FAILED(sq_call(v, 2, SQTrue, SQTrue)))
             {
                 return SQ_ERROR; // Propagate error from the callable
             }
+            // --- MODIFICATION END ---
 
+            // The rest of the logic remains the same.
             if(!SQVM::IsFalse(v->GetUp(-1)))
             {
                 match = true;
@@ -1147,6 +1152,8 @@ static SQInteger array_rfind(HSQUIRRELVM v)
 {
     return _array_find_helper(v, false);
 }
+
+// --- NO CHANGES ARE NEEDED FOR THE FUNCTIONS BELOW ---
 
 // Unified helper for first() and last() that reuses find()/rfind()
 static SQInteger _array_first_last_helper(HSQUIRRELVM v, bool is_first)
@@ -2019,8 +2026,14 @@ static SQInteger string_join(HSQUIRRELVM v)
 {
     // The separator is 'this' (the string the method is called on)
     const SQChar* separator;
-    sq_getstring(v, 1, &separator);
-    SQInteger sep_len = sq_getsize(v, 1);
+    SQInteger sep_len;
+    // sq_getstring returns a pointer and sq_getsize gets the length.
+    // They are separate calls.
+    if(SQ_FAILED(sq_getstring(v, 1, &separator)))
+    {
+        return sq_throwerror(v, _SC("could not get separator string"));
+    }
+    sep_len = sq_getsize(v, 1);
 
     // The argument must be an array
     if(sq_gettype(v, 2) != OT_ARRAY)
@@ -2030,73 +2043,52 @@ static SQInteger string_join(HSQUIRRELVM v)
     SQArray* arr = _array(stack_get(v, 2));
     SQInteger arr_size = arr->Size();
 
-    // Handle edge cases
+    // Handle edge case of an empty array
     if(arr_size == 0)
     {
         sq_pushstring(v, _SC(""), 0);
         return 1;
     }
 
-    // --- Pass 1: Calculate total length ---
-    SQInteger total_len = 0;
-    SQInteger top = sq_gettop(v); // Save stack top to restore later
+    // Use std::string as a safe, robust string builder.
+    // This avoids all GetScratchPad re-entrancy issues.
+    std::string result;
+    SQInteger top = sq_gettop(v); // Save stack top for cleanup within the loop
 
     for(SQInteger i = 0; i < arr_size; ++i)
     {
-        SQObjectPtr val;
-        arr->Get(i, val);
-        v->Push(val); // Push the element to be converted
+        // Add separator before each element except the first one.
+        if(i > 0)
+        {
+            result.append(separator, sep_len);
+        }
 
-        // Convert the element on top of the stack to string
+        // Push the element onto the stack to be converted to a string.
+        v->Push(arr->_values[i]);
+
+        // Convert the element on top of the stack to a string (replaces it in-place).
         if(SQ_FAILED(sq_tostring(v, -1)))
         {
-            sq_settop(v, top); // Clean up stack before erroring
-            // sq_tostring already set the error, so we can just return
+            // The error is already on the stack, just need to return it.
             return SQ_ERROR;
         }
 
-        total_len += sq_getsize(v, -1);
-        sq_pop(v, 1); // Pop the temporary string representation
-    }
-
-    // Add length of separators (there are n-1 separators for n items)
-    if(arr_size > 1)
-    {
-        total_len += (arr_size - 1) * sep_len;
-    }
-
-    // --- Pass 2: Build the final string ---
-    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(total_len));
-    SQChar* dest = snew;
-
-    for(SQInteger i = 0; i < arr_size; ++i)
-    {
-        SQObjectPtr val;
-        arr->Get(i, val);
-        v->Push(val);
-
-        // This should not fail as we already successfully converted them once
-        sq_tostring(v, -1);
-
+        // Safely get the string representation and append it to our C++ string.
         const SQChar* elem_str;
+        SQInteger elem_len;
         sq_getstring(v, -1, &elem_str);
-        SQInteger elem_len = sq_getsize(v, -1);
+        elem_len = sq_getsize(v, -1);
+        result.append(elem_str, elem_len);
 
-        memcpy(dest, elem_str, sq_rsl(elem_len));
-        dest += elem_len;
-
-        sq_pop(v, 1); // Pop the string
-
-        // Add separator if it's not the last element
-        if(i < arr_size - 1 && sep_len > 0)
-        {
-            memcpy(dest, separator, sq_rsl(sep_len));
-            dest += sep_len;
-        }
+        // Pop the temporary string from the stack to keep it clean.
+        sq_pop(v, 1);
     }
 
-    sq_settop(v, top); // Restore stack to original state
-    v->Push(SQString::Create(_ss(v), snew, total_len));
+    // Restore the stack to its original state before pushing the final result.
+    sq_settop(v, top);
+
+    // Push the final, joined string onto the stack as the return value.
+    sq_pushstring(v, result.c_str(), result.length());
     return 1;
 }
 
