@@ -13,7 +13,6 @@
 #include "squserdata.h"
 #include "sqarray.h"
 #include "sqclass.h"
-#include "sqbaselib.h"
 
 #define TOP() (_stack._vals[_top-1])
 #define TARGET _stack._vals[_stackbase+arg0]
