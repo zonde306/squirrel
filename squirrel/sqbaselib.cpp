@@ -766,6 +766,119 @@ static SQInteger table_map(HSQUIRRELVM v)
 	return 1;
 }
 
+// table.toarray() [Corrected Version]
+static SQInteger table_toarray(HSQUIRRELVM v)
+{
+    sq_newarray(v, 0); // Result array is at stack index 2
+
+    sq_push(v, 1);     // Push the table for iteration
+    sq_pushnull(v);    // Start iteration
+    while(SQ_SUCCEEDED(sq_next(v, -2)))
+    {
+        // Stack: ..., result_array, table, iterator, key, value
+
+        sq_newarray(v, 2); // Create a [key, value] pair array
+        // Stack: ..., key, value, pair_array
+
+        // Set key at index 0
+        sq_pushinteger(v, 0);   // Push key for the pair_array (index 0)
+        sq_push(v, -4);         // Push value for the pair_array (the original key)
+        sq_set(v, -3);          // Set pair_array[0] = original_key
+
+        // Set value at index 1
+        sq_pushinteger(v, 1);   // Push key for the pair_array (index 1)
+        sq_push(v, -3);         // Push value for the pair_array (the original value)
+        sq_set(v, -3);          // Set pair_array[1] = original_value
+
+        // Append the new pair_array to the main result_array
+        // sq_arrayappend pops the pair_array
+        sq_arrayappend(v, -5);
+
+        sq_pop(v, 2); // Pop original key and value
+    }
+    sq_pop(v, 1); // Pop iterator
+
+    return 1;
+}
+
+// table.fromarray(array_of_pairs) - static method for the table delegate
+static SQInteger table_fromarray(HSQUIRRELVM v)
+{
+    if(sq_gettype(v, 2) != OT_ARRAY)
+    {
+        return sq_throwerror(v, _SC("argument must be an array of [key, value] pairs"));
+    }
+
+    sq_newtable(v); // The new table to be returned
+
+    SQArray* arr = _array(stack_get(v, 2));
+    SQInteger size = arr->Size();
+
+    for(SQInteger i = 0; i < size; ++i)
+    {
+        SQObjectPtr& pair = arr->_values[i];
+        if(sq_type(pair) != OT_ARRAY || _array(pair)->Size() != 2)
+        {
+            sq_poptop(v); // Pop the new table
+            return sq_throwerror(v, _SC("array must contain only [key, value] pairs"));
+        }
+
+        SQArray* p = _array(pair);
+
+        v->Push(p->_values[0]); // Push key
+        v->Push(p->_values[1]); // Push value
+
+        // sq_set will pop key and value
+        if(SQ_FAILED(sq_set(v, -3)))
+        {
+            return SQ_ERROR; // Propagate error
+        }
+    }
+
+    return 1;
+}
+
+// table.update(other_table) - similar to Python dict.update()
+static SQInteger table_update(HSQUIRRELVM v)
+{
+    // The 'this' table is at stack index 1.
+    // The 'other' table (source of updates) is at stack index 2.
+
+    // We iterate over the 'other' table.
+    sq_push(v, 2); // Push the 'other' table for iteration
+    sq_pushnull(v); // Start iteration
+
+    while(SQ_SUCCEEDED(sq_next(v, -2)))
+    {
+        // Stack layout after sq_next succeeds:
+        // 1: this_table
+        // 2: other_table
+        // ...
+        // -3: other_table (copy for iteration)
+        // -2: iterator
+        // -1: key
+        // top: value
+
+        // We want to perform: this_table[key] = value
+        // sq_set(v, 1) does exactly this, using the key/value from the top of the stack.
+        if(SQ_FAILED(sq_set(v, 1)))
+        {
+            // If sq_set fails, an error is already on the VM.
+            // We need to clean up the stack before returning.
+            sq_pop(v, 4); // Pop key, value, iterator, other_table(copy)
+            return SQ_ERROR;
+        }
+        // sq_set has popped the key and value.
+        // The iterator is now on top of the stack.
+    }
+
+    // Clean up the stack by popping the other_table (copy) and the final iterator value.
+    sq_pop(v, 2);
+
+    // The update is done in-place, so we don't push a return value.
+    return 0;
+}
+
 #define TABLE_TO_ARRAY_FUNC(_funcname_,_valname_) static SQInteger _funcname_(HSQUIRRELVM v) \
 { \
 	SQObject &o = stack_get(v, 1); \
@@ -806,6 +919,9 @@ const SQRegFunction SQSharedState::_table_default_delegate_funcz[]={
 	{_SC("map"),table_map,2, _SC("tc") },
 	{_SC("keys"),table_keys,1, _SC("t") },
 	{_SC("values"),table_values,1, _SC("t") },
+    {_SC("toarray"), table_toarray, 1, _SC("t")},
+    {_SC("fromarray"), table_fromarray, 2, _SC(".a")}, // Note: nparamscheck=2 and typemask starts without 't'
+    {_SC("update"), table_update, 2, _SC("t t|x|y")},
     {NULL,(SQFUNCTION)0,0,NULL}
 };
 
@@ -1003,22 +1119,73 @@ static SQInteger array_filter(HSQUIRRELVM v)
     return 1;
 }
 
-static SQInteger array_find(HSQUIRRELVM v)
+// Unified helper for find and rfind
+static SQInteger _array_find_helper(HSQUIRRELVM v, bool forward)
 {
-    SQObject &o = stack_get(v,1);
-    SQObjectPtr &val = stack_get(v,2);
-    SQArray *a = _array(o);
+    SQArray* a = _array(stack_get(v, 1));
     SQInteger size = a->Size();
-    SQObjectPtr temp;
-    for(SQInteger n = 0; n < size; n++) {
-        bool res = false;
-        a->Get(n,temp);
-        if(SQVM::IsEqual(temp,val,res) && res) {
-            v->Push(n);
+    SQObjectPtr& search_param = stack_get(v, 2);
+    SQObjectType param_type = sq_type(search_param);
+
+    bool is_callable = (param_type == OT_CLOSURE || param_type == OT_NATIVECLOSURE);
+
+    SQInteger start = forward ? 0 : size - 1;
+    SQInteger end = forward ? size : -1;
+    SQInteger step = forward ? 1 : -1;
+
+    for(SQInteger i = start; i != end; i += step)
+    {
+        SQObjectPtr& current_val = a->_values[i];
+        bool match = false;
+
+        if(is_callable)
+        {
+            SQInteger top = sq_gettop(v);
+            sq_push(v, 2); // Push the callable
+            sq_push(v, 1); // Push 'this' (the array)
+            sq_pushinteger(v, i);
+            v->Push(current_val);
+
+            if(SQ_FAILED(sq_call(v, 3, SQTrue, SQTrue)))
+            {
+                return SQ_ERROR; // Propagate error from the callable
+            }
+
+            if(!SQVM::IsFalse(v->GetUp(-1)))
+            {
+                match = true;
+            }
+            sq_settop(v, top); // Restore stack
+        }
+        else
+        {
+            bool res = false;
+            if(SQVM::IsEqual(current_val, search_param, res) && res)
+            {
+                match = true;
+            }
+        }
+
+        if(match)
+        {
+            sq_pushinteger(v, i); // Push the index
             return 1;
         }
     }
-    return 0;
+
+    return 0; // Return null if not found
+}
+
+// Replaces the old array_find. Supports value or callback.
+static SQInteger array_find(HSQUIRRELVM v)
+{
+    return _array_find_helper(v, true);
+}
+
+// New function: array.rfind. Supports value or callback.
+static SQInteger array_rfind(HSQUIRRELVM v)
+{
+    return _array_find_helper(v, false);
 }
 
 
@@ -1380,12 +1547,13 @@ const SQRegFunction SQSharedState::_array_default_delegate_funcz[]={
     {_SC("apply"),array_apply,2, _SC("ac")},
     {_SC("reduce"),array_reduce,-2, _SC("ac.")},
     {_SC("filter"),array_filter,2, _SC("ac")},
-    {_SC("find"),array_find,2, _SC("a.")},
+    {_SC("find"),array_find,2, _SC("a c|.")},
     {_SC("any"), array_any, 2, _SC("ac")},
     {_SC("all"), array_all, 2, _SC("ac")},
     {_SC("join"), array_join, -1, _SC("a.")},
     {_SC("flat"), array_flat, -1, _SC("an")},
     {_SC("flatmap"), array_flatmap, 2, _SC("ac")},
+    {_SC("rfind"), array_rfind, 2, _SC("a c|.")},
     {NULL,(SQFUNCTION)0,0,NULL}
 };
 
@@ -2092,6 +2260,29 @@ static SQInteger string_format(HSQUIRRELVM v)
     return 1;
 }
 
+// string.toarray() [Corrected Version]
+static SQInteger string_toarray(HSQUIRRELVM v)
+{
+    const SQChar* str;
+    sq_getstring(v, 1, &str);
+    SQInteger len = sq_getsize(v, 1);
+
+    sq_newarray(v, len); // Pre-size for efficiency
+    for(SQInteger i = 0; i < len; ++i)
+    {
+        // Prepare for sq_set on the array at stack index -3
+        sq_pushinteger(v, i);          // Push key (the index)
+        sq_pushstring(v, &str[i], 1);  // Push value (the character string)
+
+        // sq_set pops key and value, sets array[key] = value
+        if(SQ_FAILED(sq_set(v, -3)))
+        {
+            return SQ_ERROR; // Should not fail on a new array, but good practice
+        }
+    }
+    return 1;
+}
+
 #define STRING_TOFUNCZ(func) static SQInteger string_##func(HSQUIRRELVM v) \
 {\
     SQInteger sidx,eidx; \
@@ -2143,6 +2334,7 @@ const SQRegFunction SQSharedState::_string_default_delegate_funcz[]={
     {_SC("replace"), string_replace, -3, _SC("sssn")},
     {_SC("join"), string_join, 2, _SC("sa")},
     {_SC("format"), string_format, -1, _SC("s.")},
+    {_SC("toarray"), string_toarray, 1, _SC("s")},
     {NULL,(SQFUNCTION)0,0,NULL}
 };
 
