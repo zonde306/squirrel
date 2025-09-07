@@ -98,6 +98,12 @@ typedef wchar_t SQChar;
 #define sciscntrl   iswcntrl
 #define scisalnum   iswalnum
 
+#define scislower   iswlower
+#define scisupper   iswupper
+#define sctolower   towlower
+#define sctoupper   towupper
+#define scstrncmp   wcsncmp
+#define scstrchr    wcschr
 
 #define sq_rsl(l) ((l)<<WCHAR_SHIFT_MUL)
 
@@ -133,6 +139,13 @@ typedef char SQChar;
 #define scisalnum   isalnum
 #define scprintf    printf
 #define MAX_CHAR 0xFF
+
+#define scislower   islower
+#define scisupper   isupper
+#define sctolower   tolower
+#define sctoupper   toupper
+#define scstrncmp   strncmp
+#define scstrchr    strchr
 
 #define sq_rsl(l) (l)
 

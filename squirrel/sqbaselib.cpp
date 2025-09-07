@@ -405,6 +405,247 @@ static SQInteger default_delegate_tostring(HSQUIRRELVM v)
     return 1;
 }
 
+// Forward declaration
+static SQRESULT pretty_tostring_recursive(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx);
+
+// Helper for correct object identity comparison.
+static bool obj_is_identical(const SQObjectPtr& o1, const SQObjectPtr& o2)
+{
+    if(o1._type != o2._type) return false;
+    // For ref-counted types, comparing pointers is sufficient for identity.
+    // For primitives, comparing raw value is also correct.
+    return o1._unVal.raw == o2._unVal.raw;
+}
+
+// Helper to check if an object is already in the recursion detector array
+static bool is_in_recursion_detector(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx)
+{
+    SQObjectPtr& obj = stack_get(v, obj_idx);
+    SQArray* detector = _array(stack_get(v, recursion_detector_idx));
+    SQInteger size = detector->Size();
+    for(SQInteger i = 0; i < size; ++i)
+    {
+        if(obj_is_identical(detector->_values[i], obj))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Helper to generate a 'repr'-like string with quotes and escapes
+static void string_repr(HSQUIRRELVM v, const SQChar* str, SQInteger len)
+{
+    // Estimate new length
+    SQInteger new_len_estimate = len + 2;
+    for(SQInteger i = 0; i < len; ++i)
+    {
+        switch(str[i])
+        {
+            case '\"': case '\\': case '\n': case '\r': case '\t':
+                new_len_estimate++; break;
+        }
+    }
+
+    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(new_len_estimate));
+    SQChar* dest = snew;
+    *dest++ = '\"';
+    for(SQInteger i = 0; i < len; ++i)
+    {
+        SQChar c = str[i];
+        switch(c)
+        {
+            case '\"': *dest++ = '\\'; *dest++ = '\"'; break;
+            case '\\': *dest++ = '\\'; *dest++ = '\\'; break;
+            case '\n': *dest++ = '\\'; *dest++ = 'n'; break;
+            case '\r': *dest++ = '\\'; *dest++ = 'r'; break;
+            case '\t': *dest++ = '\\'; *dest++ = 't'; break;
+            default: *dest++ = c; break;
+        }
+    }
+    *dest++ = '\"';
+    v->Push(SQString::Create(_ss(v), snew, dest - snew));
+}
+
+// A single function to build the final string for arrays and tables
+static SQRESULT build_pretty_string(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx, SQInteger total_len)
+{
+    SQObjectPtr& o = stack_get(v, obj_idx);
+    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(total_len));
+    SQChar* dest = snew;
+    SQInteger top = sq_gettop(v); // Save stack top
+
+    if(sq_type(o) == OT_ARRAY)
+    {
+        *dest++ = '[';
+        SQArray* a = _array(o);
+        SQInteger size = a->Size();
+        for(SQInteger i = 0; i < size; ++i)
+        {
+            v->Push(a->_values[i]);
+            pretty_tostring_recursive(v, sq_gettop(v), recursion_detector_idx);
+
+            const SQChar* part_str;
+            sq_getstring(v, -1, &part_str);
+            SQInteger part_len = sq_getsize(v, -1);
+            memcpy(dest, part_str, sq_rsl(part_len));
+            dest += part_len;
+
+            sq_pop(v, 2); // Pop stringified and original value
+
+            if(i < size - 1)
+            {
+                *dest++ = ','; *dest++ = ' ';
+            }
+        }
+        *dest++ = ']';
+    }
+    else
+    { // Table-like
+        *dest++ = '{';
+        sq_push(v, obj_idx);
+        sq_pushnull(v);
+        bool first = true;
+        while(SQ_SUCCEEDED(sq_next(v, -2)))
+        {
+            // Stack: table, iterator, key, value
+            if(!first)
+            {
+                *dest++ = ','; *dest++ = ' ';
+            }
+            first = false;
+
+            // Key
+            pretty_tostring_recursive(v, sq_gettop(v) - 1, recursion_detector_idx);
+            const SQChar* key_str;
+            sq_getstring(v, -1, &key_str);
+            SQInteger key_len = sq_getsize(v, -1);
+            memcpy(dest, key_str, sq_rsl(key_len));
+            dest += key_len;
+            sq_pop(v, 1);
+
+            *dest++ = ':'; *dest++ = ' ';
+
+            // Value
+            pretty_tostring_recursive(v, sq_gettop(v) - 2, recursion_detector_idx);
+            const SQChar* val_str;
+            sq_getstring(v, -1, &val_str);
+            SQInteger val_len = sq_getsize(v, -1);
+            memcpy(dest, val_str, sq_rsl(val_len));
+            dest += val_len;
+            sq_pop(v, 1);
+
+            sq_pop(v, 2); // Pop original key and val
+        }
+        sq_pop(v, 1); // Pop iterator
+        *dest++ = '}';
+    }
+
+    sq_settop(v, top); // Restore stack
+    v->Push(SQString::Create(_ss(v), snew, total_len));
+    return SQ_OK;
+}
+
+// Core recursive pretty-printing function (two-pass implementation)
+static SQRESULT pretty_tostring_recursive(HSQUIRRELVM v, SQInteger obj_idx, SQInteger recursion_detector_idx)
+{
+    SQObjectPtr& o = stack_get(v, obj_idx < 0 ? sq_gettop(v) + obj_idx + 1 : obj_idx);
+    SQInteger top = sq_gettop(v);
+
+    switch(sq_type(o))
+    {
+        case OT_STRING:
+            string_repr(v, _stringval(o), _string(o)->_len);
+            return SQ_OK;
+
+        case OT_ARRAY:
+        case OT_TABLE:
+        case OT_INSTANCE:
+        case OT_CLASS:
+        {
+            if(is_in_recursion_detector(v, obj_idx, recursion_detector_idx))
+            {
+                sq_pushstring(v, (sq_type(o) == OT_ARRAY) ? _SC("[...]") : _SC("{...}"), -1);
+                return SQ_OK;
+            }
+
+            SQInteger size = sq_getsize(v, obj_idx);
+            if(size == 0)
+            {
+                sq_pushstring(v, (sq_type(o) == OT_ARRAY) ? _SC("[]") : _SC("{}"), -1);
+                return SQ_OK;
+            }
+
+            sq_push(v, obj_idx);
+            sq_arrayappend(v, recursion_detector_idx);
+
+            // Pass 1: Calculate Length
+            SQInteger total_len = 2; // For '[' and ']' or '{' and '}'
+            if(sq_type(o) == OT_ARRAY)
+            {
+                SQArray* a = _array(o);
+                for(SQInteger i = 0; i < size; ++i)
+                {
+                    v->Push(a->_values[i]);
+                    if(SQ_FAILED(pretty_tostring_recursive(v, sq_gettop(v), recursion_detector_idx))) return SQ_ERROR;
+                    total_len += sq_getsize(v, -1);
+                    sq_pop(v, 2); // Pop stringified and original value
+                }
+                if(size > 1) total_len += (size - 1) * 2; // For ", "
+            }
+            else
+            { // Table-like
+                sq_push(v, obj_idx);
+                sq_pushnull(v);
+                bool first = true;
+                while(SQ_SUCCEEDED(sq_next(v, -2)))
+                {
+                    if(!first) total_len += 2; // ", "
+                    first = false;
+
+                    // Key
+                    if(SQ_FAILED(pretty_tostring_recursive(v, sq_gettop(v) - 1, recursion_detector_idx))) return SQ_ERROR;
+                    total_len += sq_getsize(v, -1) + 2; // ": "
+                    sq_pop(v, 1);
+
+                    // Value
+                    if(SQ_FAILED(pretty_tostring_recursive(v, sq_gettop(v) - 2, recursion_detector_idx))) return SQ_ERROR;
+                    total_len += sq_getsize(v, -1);
+                    sq_pop(v, 1);
+
+                    sq_pop(v, 2); // Pop original key and value
+                }
+                sq_pop(v, 1); // Pop iterator
+            }
+
+            // Pass 2: Build String
+            build_pretty_string(v, obj_idx, recursion_detector_idx, total_len);
+
+            sq_arraypop(v, recursion_detector_idx, SQFalse); // Pop self
+            sq_settop(v, top); // Restore stack
+            sq_push(v, top + 1); // Push the result string
+            sq_remove(v, top + 1); // Remove it from its old position
+            return SQ_OK;
+        }
+
+        default:
+            return sq_tostring(v, obj_idx);
+    }
+}
+
+static SQRESULT pretty_tostring_entry(HSQUIRRELVM v)
+{
+    sq_newarray(v, 0); // Create recursion detector
+    SQRESULT res = pretty_tostring_recursive(v, 1, 2);
+    if(SQ_FAILED(res))
+    {
+        return SQ_ERROR;
+    }
+    // Result is on top, recursion detector is below it. Remove detector.
+    sq_remove(v, -2);
+    return 1;
+}
+
 static SQInteger obj_delegate_weakref(HSQUIRRELVM v)
 {
     sq_weakref(v,1);
@@ -557,7 +798,7 @@ const SQRegFunction SQSharedState::_table_default_delegate_funcz[]={
     {_SC("rawdelete"),table_rawdelete,2, _SC("t")},
     {_SC("rawin"),container_rawexists,2, _SC("t")},
     {_SC("weakref"),obj_delegate_weakref,1, NULL },
-    {_SC("tostring"),default_delegate_tostring,1, _SC(".")},
+    {_SC("tostring"),pretty_tostring_entry,1, _SC(".")},
     {_SC("clear"),obj_clear,1, _SC(".")},
     {_SC("setdelegate"),table_setdelegate,2, _SC(".t|o")},
     {_SC("getdelegate"),table_getdelegate,1, _SC(".")},
@@ -906,6 +1147,219 @@ static SQInteger array_slice(HSQUIRRELVM v)
 
 }
 
+// Helper function for any() and all()
+static SQInteger _array_any_all_helper(HSQUIRRELVM v, bool is_any)
+{
+    SQObject& o = stack_get(v, 1);
+    SQArray* a = _array(o);
+    SQInteger size = a->Size();
+
+    // Behavior for empty arrays:
+    // any([]) is false
+    // all([]) is true
+    if(size == 0)
+    {
+        sq_pushbool(v, !is_any);
+        return 1;
+    }
+
+    SQObjectPtr val;
+    for(SQInteger n = 0; n < size; n++)
+    {
+        a->Get(n, val);
+
+        // Prepare the call
+        sq_push(v, 2); // Push the callable
+        sq_push(v, 1); // Push 'this' (the array)
+        sq_pushinteger(v, n); // Push index
+        v->Push(val); // Push value
+
+        // Call the function: callable(index, value)
+        if(SQ_FAILED(sq_call(v, 3, SQTrue, SQFalse)))
+        {
+            return SQ_ERROR; // Propagate errors from the callable
+        }
+
+        SQBool result_is_false = SQVM::IsFalse(v->GetUp(-1));
+        sq_pop(v, 1); // Pop the result from the callable
+
+        if(is_any)
+        {
+            // For 'any', if we find a single truthy value, we can stop and return true.
+            if(!result_is_false)
+            {
+                sq_pushbool(v, SQTrue);
+                return 1; // Short-circuit
+            }
+        }
+        else
+        { // is 'all'
+             // For 'all', if we find a single falsy value, we can stop and return false.
+            if(result_is_false)
+            {
+                sq_pushbool(v, SQFalse);
+                return 1; // Short-circuit
+            }
+        }
+    }
+
+    // If the loop completes without short-circuiting:
+    // For 'any', it means no truthy values were found -> return false.
+    // For 'all', it means no falsy values were found -> return true.
+    sq_pushbool(v, !is_any);
+    return 1;
+}
+
+// array.any(callable) - equivalent to JS array.some()
+static SQInteger array_any(HSQUIRRELVM v)
+{
+    return _array_any_all_helper(v, true);
+}
+
+// array.all(callable) - equivalent to JS array.every()
+static SQInteger array_all(HSQUIRRELVM v)
+{
+    return _array_any_all_helper(v, false);
+}
+
+// array.join(separator) - similar to JS array.join()
+// This function reuses the string.join() implementation by rearranging the call.
+static SQInteger array_join(HSQUIRRELVM v)
+{
+    // Stack layout: 1=array(this), 2=separator(optional)
+
+    // 1. Push the separator onto the stack. If not provided, use "," as default.
+    if(sq_gettop(v) < 2 || sq_gettype(v, 2) == OT_NULL)
+    {
+        sq_pushstring(v, _SC(","), 1);
+    }
+    else
+    {
+        sq_push(v, 2); // Push the provided separator argument
+    }
+
+    // 2. Ensure the separator is a string before we look for methods on it.
+    if(SQ_FAILED(sq_tostring(v, -1)))
+    {
+        return SQ_ERROR; // sq_tostring will set the error message.
+    }
+    // Now the separator string is definitely on top of the stack.
+
+    // 3. Get the "join" method from the separator string.
+    sq_pushstring(v, _SC("join"), -1); // Push the key "join"
+    if(SQ_FAILED(sq_get(v, -2)))
+    {
+        // Get the method from the separator string
+        // This should not happen if string.join is registered correctly.
+        return sq_throwerror(v, _SC("internal error: string.join method not found"));
+    }
+    // Stack top is now the join closure. Below it is the separator string.
+
+    // 4. Prepare for the call: separator.join(array)
+    // Push 'this' for the call (the separator string)
+    sq_push(v, -2);
+    // Push the argument for the call (the original array from index 1)
+    sq_push(v, 1);
+
+    // 5. Call the function.
+    // We have 2 params (this + 1 arg), want 1 return value, and want errors to be raised.
+    if(SQ_FAILED(sq_call(v, 2, SQTrue, SQTrue)))
+    {
+        return SQ_ERROR; // Propagate error from string.join
+    }
+
+    // The result from string.join is now on top of the stack.
+    return 1;
+}
+
+// Recursive helper for array.flat()
+static void _array_flat_recursive(HSQUIRRELVM v, SQArray* dest, SQArray* src, SQInteger depth)
+{
+    SQInteger size = src->Size();
+    for(SQInteger i = 0; i < size; ++i)
+    {
+        SQObjectPtr& elem = src->_values[i]; // Direct access for efficiency
+        if(sq_type(elem) == OT_ARRAY && depth > 0)
+        {
+            _array_flat_recursive(v, dest, _array(elem), depth - 1);
+        }
+        else
+        {
+            dest->Append(elem);
+        }
+    }
+}
+
+// array.flat([depth]) - similar to JS array.flat()
+static SQInteger array_flat(HSQUIRRELVM v)
+{
+    SQArray* a = _array(stack_get(v, 1));
+
+    SQInteger depth = 1; // Default depth is 1
+    if(sq_gettop(v) > 1)
+    {
+        if(SQ_FAILED(sq_getinteger(v, 2, &depth)))
+        {
+            return sq_throwerror(v, _SC("depth must be an integer"));
+        }
+    }
+
+    // JS treats negative depth as 0
+    if(depth < 0)
+    {
+        depth = 0;
+    }
+
+    SQArray* result = SQArray::Create(_ss(v), 0);
+    _array_flat_recursive(v, result, a, depth);
+
+    v->Push(result);
+    return 1;
+}
+
+// array.flatMap(callable) - similar to JS array.flatMap()
+static SQInteger array_flatmap(HSQUIRRELVM v)
+{
+    SQArray* a = _array(stack_get(v, 1));
+    SQInteger size = a->Size();
+    SQInteger top = sq_gettop(v);
+
+    SQArray* result = SQArray::Create(_ss(v), 0);
+
+    for(SQInteger i = 0; i < size; ++i)
+    {
+        // Prepare the call: callable(index, value)
+        sq_push(v, 2); // Push the callable
+        sq_push(v, 1); // Push 'this' (the array)
+        sq_pushinteger(v, i);
+        v->Push(a->_values[i]);
+
+        if(SQ_FAILED(sq_call(v, 3, SQTrue, SQTrue)))
+        {
+            sq_settop(v, top); // Restore stack on error
+            return SQ_ERROR;
+        }
+
+        SQObjectPtr map_result = v->GetUp(-1);
+
+        // Flatten the result of the map operation (depth 1)
+        if(sq_type(map_result) == OT_ARRAY)
+        {
+            SQArray* sub_array = _array(map_result);
+            result->Extend(sub_array); // Efficiently append all elements
+        }
+        else
+        {
+            result->Append(map_result);
+        }
+
+        sq_poptop(v); // Pop the map_result
+    }
+
+    v->Push(result);
+    return 1;
+}
+
 const SQRegFunction SQSharedState::_array_default_delegate_funcz[]={
     {_SC("len"),default_delegate_len,1, _SC("a")},
     {_SC("append"),array_append,2, _SC("a")},
@@ -920,13 +1374,18 @@ const SQRegFunction SQSharedState::_array_default_delegate_funcz[]={
     {_SC("sort"),array_sort,-1, _SC("ac")},
     {_SC("slice"),array_slice,-1, _SC("ann")},
     {_SC("weakref"),obj_delegate_weakref,1, NULL },
-    {_SC("tostring"),default_delegate_tostring,1, _SC(".")},
+    {_SC("tostring"),pretty_tostring_entry,1, _SC(".")},
     {_SC("clear"),obj_clear,1, _SC(".")},
     {_SC("map"),array_map,2, _SC("ac")},
     {_SC("apply"),array_apply,2, _SC("ac")},
     {_SC("reduce"),array_reduce,-2, _SC("ac.")},
     {_SC("filter"),array_filter,2, _SC("ac")},
     {_SC("find"),array_find,2, _SC("a.")},
+    {_SC("any"), array_any, 2, _SC("ac")},
+    {_SC("all"), array_all, 2, _SC("ac")},
+    {_SC("join"), array_join, -1, _SC("a.")},
+    {_SC("flat"), array_flat, -1, _SC("an")},
+    {_SC("flatmap"), array_flatmap, 2, _SC("ac")},
     {NULL,(SQFUNCTION)0,0,NULL}
 };
 
@@ -963,6 +1422,676 @@ static SQInteger string_find(HSQUIRRELVM v)
     return sq_throwerror(v,_SC("invalid param"));
 }
 
+// Helper function to check if a character is whitespace
+static bool _is_sqspace(SQChar c)
+{
+    return scisspace(c);
+}
+
+// str.split(separator=None, maxsplit=-1)
+static SQInteger string_split(HSQUIRRELVM v)
+{
+    const SQChar* str, * sep = NULL;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    SQInteger sep_len = 0, maxsplit = -1;
+    SQInteger top = sq_gettop(v);
+
+    if(top > 1 && sq_gettype(v, 2) != OT_NULL)
+    {
+        sq_getstring(v, 2, &sep);
+        sep_len = sq_getsize(v, 2);
+    }
+    if(top > 2)
+    {
+        sq_getinteger(v, 3, &maxsplit);
+    }
+
+    sq_newarray(v, 0); // Create the result array
+
+    if(sep)
+    { // Separator is specified
+        if(sep_len == 0)
+        {
+            return sq_throwerror(v, _SC("empty separator"));
+        }
+        const SQChar* start = str;
+        const SQChar* found;
+        SQInteger splits = 0;
+        while((maxsplit < 0 || splits < maxsplit) && (found = scstrstr(start, sep)) != NULL)
+        {
+            sq_pushstring(v, start, found - start);
+            sq_arrayappend(v, -2);
+            start = found + sep_len;
+            splits++;
+        }
+        sq_pushstring(v, start, str_len - (start - str));
+        sq_arrayappend(v, -2);
+    }
+    else
+    { // Separator is not specified, split by whitespace
+        const SQChar* start = str;
+        const SQChar* end = str + str_len;
+        while(start < end)
+        {
+            while(start < end && _is_sqspace(*start))
+            {
+                start++;
+            }
+            if(start < end)
+            {
+                const SQChar* word_end = start;
+                while(word_end < end && !_is_sqspace(*word_end))
+                {
+                    word_end++;
+                }
+                sq_pushstring(v, start, word_end - start);
+                sq_arrayappend(v, -2);
+                start = word_end;
+            }
+        }
+    }
+    return 1;
+}
+
+// str.startswith(prefix)
+static SQInteger string_startswith(HSQUIRRELVM v)
+{
+    const SQChar* str, * prefix;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    sq_getstring(v, 2, &prefix);
+    SQInteger prefix_len = sq_getsize(v, 2);
+
+    if(str_len < prefix_len)
+    {
+        sq_pushbool(v, SQFalse);
+        return 1;
+    }
+
+    sq_pushbool(v, scstrncmp(str, prefix, prefix_len) == 0);
+    return 1;
+}
+
+// str.endswith(suffix)
+static SQInteger string_endswith(HSQUIRRELVM v)
+{
+    const SQChar* str, * suffix;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    sq_getstring(v, 2, &suffix);
+    SQInteger suffix_len = sq_getsize(v, 2);
+
+    if(str_len < suffix_len)
+    {
+        sq_pushbool(v, SQFalse);
+        return 1;
+    }
+
+    sq_pushbool(v, scstrncmp(str + str_len - suffix_len, suffix, suffix_len) == 0);
+    return 1;
+}
+
+// Generic helper for is_... functions
+static SQInteger string_is_helper(HSQUIRRELVM v, int (*pred)(int))
+{
+    const SQChar* str;
+    sq_getstring(v, 1, &str);
+    SQInteger len = sq_getsize(v, 1);
+    if(len == 0)
+    {
+        sq_pushbool(v, SQFalse);
+        return 1;
+    }
+    for(SQInteger i = 0; i < len; ++i)
+    {
+        if(!pred(str[i]))
+        {
+            sq_pushbool(v, SQFalse);
+            return 1;
+        }
+    }
+    sq_pushbool(v, SQTrue);
+    return 1;
+}
+
+static SQInteger string_isalnum(HSQUIRRELVM v)
+{
+    return string_is_helper(v, scisalnum);
+}
+static SQInteger string_islower(HSQUIRRELVM v)
+{
+    return string_is_helper(v, scislower);
+}
+static SQInteger string_isupper(HSQUIRRELVM v)
+{
+    return string_is_helper(v, scisupper);
+}
+static SQInteger string_isspace(HSQUIRRELVM v)
+{
+    return string_is_helper(v, scisspace);
+}
+static SQInteger string_isnumeric(HSQUIRRELVM v)
+{
+    return string_is_helper(v, scisdigit);
+}
+
+// Generic helper for strip functions
+static SQInteger string_strip_helper(HSQUIRRELVM v, bool lstrip, bool rstrip)
+{
+    const SQChar* str;
+    sq_getstring(v, 1, &str);
+    SQInteger len = sq_getsize(v, 1);
+
+    const SQChar* chars = NULL;
+    if(sq_gettop(v) > 1)
+    {
+        sq_getstring(v, 2, &chars);
+    }
+
+    SQInteger start = 0, end = len;
+    if(lstrip)
+    {
+        while(start < end)
+        {
+            if(chars)
+            {
+                if(scstrchr(chars, str[start]) == NULL) break;
+            }
+            else
+            {
+                if(!_is_sqspace(str[start])) break;
+            }
+            start++;
+        }
+    }
+    if(rstrip)
+    {
+        while(end > start)
+        {
+            if(chars)
+            {
+                if(scstrchr(chars, str[end - 1]) == NULL) break;
+            }
+            else
+            {
+                if(!_is_sqspace(str[end - 1])) break;
+            }
+            end--;
+        }
+    }
+
+    sq_pushstring(v, str + start, end - start);
+    return 1;
+}
+
+static SQInteger string_strip(HSQUIRRELVM v)
+{
+    return string_strip_helper(v, true, true);
+}
+static SQInteger string_lstrip(HSQUIRRELVM v)
+{
+    return string_strip_helper(v, true, false);
+}
+static SQInteger string_rstrip(HSQUIRRELVM v)
+{
+    return string_strip_helper(v, false, true);
+}
+
+
+// str.removeprefix(prefix)
+static SQInteger string_removeprefix(HSQUIRRELVM v)
+{
+    const SQChar* str, * prefix;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    sq_getstring(v, 2, &prefix);
+    SQInteger prefix_len = sq_getsize(v, 2);
+
+    if(str_len >= prefix_len && scstrncmp(str, prefix, prefix_len) == 0)
+    {
+        sq_pushstring(v, str + prefix_len, str_len - prefix_len);
+    }
+    else
+    {
+        sq_push(v, 1); // push original string
+    }
+    return 1;
+}
+
+// str.removesuffix(suffix)
+static SQInteger string_removesuffix(HSQUIRRELVM v)
+{
+    const SQChar* str, * suffix;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    sq_getstring(v, 2, &suffix);
+    SQInteger suffix_len = sq_getsize(v, 2);
+
+    if(str_len >= suffix_len && scstrncmp(str + str_len - suffix_len, suffix, suffix_len) == 0)
+    {
+        sq_pushstring(v, str, str_len - suffix_len);
+    }
+    else
+    {
+        sq_push(v, 1); // push original string
+    }
+    return 1;
+}
+
+// str.rfind(sub)
+static SQInteger string_rfind(HSQUIRRELVM v)
+{
+    const SQChar* str, * sub;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    sq_getstring(v, 2, &sub);
+    SQInteger sub_len = sq_getsize(v, 2);
+
+    if(sub_len == 0)
+    {
+        sq_pushinteger(v, str_len);
+        return 1;
+    }
+    if(str_len >= sub_len)
+    {
+        for(SQInteger i = str_len - sub_len; i >= 0; --i)
+        {
+            if(scstrncmp(str + i, sub, sub_len) == 0)
+            {
+                sq_pushinteger(v, i);
+                return 1;
+            }
+        }
+    }
+
+    sq_pushinteger(v, -1);
+    return 1;
+}
+
+// str.zfill(width)
+static SQInteger string_zfill(HSQUIRRELVM v)
+{
+    const SQChar* str;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    SQInteger width;
+    sq_getinteger(v, 2, &width);
+
+    if(str_len >= width)
+    {
+        sq_push(v, 1); // push original string
+        return 1;
+    }
+
+    SQInteger pad_len = width - str_len;
+    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(width));
+    const SQChar* p = str;
+
+    if(str_len > 0 && (*p == '+' || *p == '-'))
+    {
+        snew[0] = *p;
+        p++;
+        str_len--;
+        for(SQInteger i = 0; i < pad_len; ++i) snew[i + 1] = '0';
+        memcpy(snew + 1 + pad_len, p, sq_rsl(str_len));
+    }
+    else
+    {
+        for(SQInteger i = 0; i < pad_len; ++i) snew[i] = '0';
+        memcpy(snew + pad_len, p, sq_rsl(str_len));
+    }
+
+    v->Push(SQString::Create(_ss(v), snew, width));
+    return 1;
+}
+
+
+// str.replace(old, new, count=-1)
+static SQInteger string_replace(HSQUIRRELVM v)
+{
+    const SQChar* str, * old_sub, * new_sub;
+    sq_getstring(v, 1, &str);
+    SQInteger str_len = sq_getsize(v, 1);
+    sq_getstring(v, 2, &old_sub);
+    SQInteger old_len = sq_getsize(v, 2);
+    sq_getstring(v, 3, &new_sub);
+    SQInteger new_len = sq_getsize(v, 3);
+    SQInteger count = -1;
+    if(sq_gettop(v) > 3)
+    {
+        sq_getinteger(v, 4, &count);
+    }
+
+    if(old_len == 0)
+    {
+        return sq_throwerror(v, _SC("old substring cannot be empty"));
+    }
+
+    // First pass: count occurrences and calculate new length
+    SQInteger occurrences = 0;
+    const SQChar* p = str;
+    while((count < 0 || occurrences < count) && (p = scstrstr(p, old_sub)) != NULL)
+    {
+        occurrences++;
+        p += old_len;
+    }
+
+    if(occurrences == 0)
+    {
+        sq_push(v, 1); // No replacements, return original string
+        return 1;
+    }
+
+    SQInteger new_str_len = str_len + occurrences * (new_len - old_len);
+    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(new_str_len));
+    SQChar* dest = snew;
+    const SQChar* start = str;
+
+    // Second pass: build the new string
+    p = str;
+    SQInteger replaced_count = 0;
+    while((count < 0 || replaced_count < count) && (p = scstrstr(start, old_sub)) != NULL)
+    {
+        SQInteger segment_len = p - start;
+        memcpy(dest, start, sq_rsl(segment_len));
+        dest += segment_len;
+
+        memcpy(dest, new_sub, sq_rsl(new_len));
+        dest += new_len;
+
+        start = p + old_len;
+        replaced_count++;
+    }
+
+    // Copy remaining part
+    if(*start)
+    {
+        memcpy(dest, start, sq_rsl(str + str_len - start));
+    }
+
+    v->Push(SQString::Create(_ss(v), snew, new_str_len));
+    return 1;
+}
+
+// str.join(array)
+static SQInteger string_join(HSQUIRRELVM v)
+{
+    // The separator is 'this' (the string the method is called on)
+    const SQChar* separator;
+    sq_getstring(v, 1, &separator);
+    SQInteger sep_len = sq_getsize(v, 1);
+
+    // The argument must be an array
+    if(sq_gettype(v, 2) != OT_ARRAY)
+    {
+        return sq_throwerror(v, _SC("join expects an array as an argument"));
+    }
+    SQArray* arr = _array(stack_get(v, 2));
+    SQInteger arr_size = arr->Size();
+
+    // Handle edge cases
+    if(arr_size == 0)
+    {
+        sq_pushstring(v, _SC(""), 0);
+        return 1;
+    }
+
+    // --- Pass 1: Calculate total length ---
+    SQInteger total_len = 0;
+    SQInteger top = sq_gettop(v); // Save stack top to restore later
+
+    for(SQInteger i = 0; i < arr_size; ++i)
+    {
+        SQObjectPtr val;
+        arr->Get(i, val);
+        v->Push(val); // Push the element to be converted
+
+        // Convert the element on top of the stack to string
+        if(SQ_FAILED(sq_tostring(v, -1)))
+        {
+            sq_settop(v, top); // Clean up stack before erroring
+            // sq_tostring already set the error, so we can just return
+            return SQ_ERROR;
+        }
+
+        total_len += sq_getsize(v, -1);
+        sq_pop(v, 1); // Pop the temporary string representation
+    }
+
+    // Add length of separators (there are n-1 separators for n items)
+    if(arr_size > 1)
+    {
+        total_len += (arr_size - 1) * sep_len;
+    }
+
+    // --- Pass 2: Build the final string ---
+    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(total_len));
+    SQChar* dest = snew;
+
+    for(SQInteger i = 0; i < arr_size; ++i)
+    {
+        SQObjectPtr val;
+        arr->Get(i, val);
+        v->Push(val);
+
+        // This should not fail as we already successfully converted them once
+        sq_tostring(v, -1);
+
+        const SQChar* elem_str;
+        sq_getstring(v, -1, &elem_str);
+        SQInteger elem_len = sq_getsize(v, -1);
+
+        memcpy(dest, elem_str, sq_rsl(elem_len));
+        dest += elem_len;
+
+        sq_pop(v, 1); // Pop the string
+
+        // Add separator if it's not the last element
+        if(i < arr_size - 1 && sep_len > 0)
+        {
+            memcpy(dest, separator, sq_rsl(sep_len));
+            dest += sep_len;
+        }
+    }
+
+    sq_settop(v, top); // Restore stack to original state
+    v->Push(SQString::Create(_ss(v), snew, total_len));
+    return 1;
+}
+
+// Helper to convert string to integer for format key
+static bool _string_to_sqinteger(const SQChar* s, SQInteger len, SQInteger* out)
+{
+    if(len == 0) return false;
+    SQInteger res = 0;
+    for(SQInteger i = 0; i < len; ++i)
+    {
+        if(!scisdigit(s[i])) return false;
+        res = res * 10 + (s[i] - '0');
+    }
+    *out = res;
+    return true;
+}
+
+// str.format(...)
+static SQInteger string_format(HSQUIRRELVM v)
+{
+    const SQChar* fmt_str;
+    sq_getstring(v, 1, &fmt_str);
+    SQInteger fmt_len = sq_getsize(v, 1);
+    SQInteger top = sq_gettop(v);
+
+    // Determine argument mode: positional or named (table)
+    bool named_mode = (top == 2 && sq_gettype(v, 2) == OT_TABLE);
+
+    // --- Pass 1: Calculate total length ---
+    SQInteger total_len = 0;
+    SQInteger auto_arg_idx = 2; // Stack index for automatic {}
+
+    for(SQInteger i = 0; i < fmt_len; ++i)
+    {
+        if(fmt_str[i] == '{')
+        {
+            if(i + 1 < fmt_len && fmt_str[i + 1] == '{')
+            { // Escaped {{
+                total_len++;
+                i++;
+                continue;
+            }
+
+            SQInteger key_start = i + 1;
+            SQInteger key_end = key_start;
+            while(key_end < fmt_len && fmt_str[key_end] != '}')
+            {
+                key_end++;
+            }
+            if(key_end == fmt_len)
+            {
+                return sq_throwerror(v, _SC("unmatched '{' in format string"));
+            }
+
+            SQInteger key_len = key_end - key_start;
+
+            if(named_mode)
+            {
+                sq_push(v, 2); // Push the table
+                sq_pushstring(v, fmt_str + key_start, key_len);
+                if(SQ_FAILED(sq_get(v, -2)))
+                {
+                    sq_pop(v, 1); // Pop table
+                    return sq_throwerror(v, _SC("key not found in format table"));
+                }
+            }
+            else
+            { // Positional mode
+                SQInteger arg_idx = -1;
+                if(key_len == 0)
+                { // {}
+                    arg_idx = auto_arg_idx++;
+                }
+                else
+                { // {n}
+                    SQInteger n;
+                    if(!_string_to_sqinteger(fmt_str + key_start, key_len, &n))
+                    {
+                        return sq_throwerror(v, _SC("invalid format key (must be a number for positional args)"));
+                    }
+                    arg_idx = n + 2; // Convert 0-based index to stack index
+                }
+
+                if(arg_idx > top)
+                {
+                    return sq_throwerror(v, _SC("not enough arguments for format string"));
+                }
+                sq_push(v, arg_idx);
+            }
+
+            if(SQ_FAILED(sq_tostring(v, -1)))
+            {
+                // error is already set by sq_tostring
+                return SQ_ERROR;
+            }
+            total_len += sq_getsize(v, -1);
+            sq_pop(v, (named_mode ? 2 : 1)); // Pop string and maybe table
+            i = key_end; // Move parser past the '}'
+        }
+        else if(fmt_str[i] == '}')
+        {
+            if(i + 1 < fmt_len && fmt_str[i + 1] == '}')
+            { // Escaped }}
+                total_len++;
+                i++;
+                continue;
+            }
+            return sq_throwerror(v, _SC("single '}' encountered in format string"));
+        }
+        else
+        {
+            total_len++;
+        }
+    }
+
+    // --- Pass 2: Build the final string ---
+    SQChar* snew = _ss(v)->GetScratchPad(sq_rsl(total_len));
+    SQChar* dest = snew;
+    auto_arg_idx = 2; // Reset for second pass
+
+    for(SQInteger i = 0; i < fmt_len; ++i)
+    {
+        if(fmt_str[i] == '{')
+        {
+            if(i + 1 < fmt_len && fmt_str[i + 1] == '{')
+            { // Escaped {{
+                *dest++ = '{';
+                i++;
+                continue;
+            }
+
+            SQInteger key_start = i + 1;
+            SQInteger key_end = key_start;
+            while(key_end < fmt_len && fmt_str[key_end] != '}')
+            {
+                key_end++;
+            }
+
+            SQInteger key_len = key_end - key_start;
+
+            // Get value again
+            if(named_mode)
+            {
+                sq_push(v, 2);
+                sq_pushstring(v, fmt_str + key_start, key_len);
+                sq_get(v, -2);
+            }
+            else
+            {
+                SQInteger arg_idx = -1;
+                if(key_len == 0)
+                {
+                    arg_idx = auto_arg_idx++;
+                }
+                else
+                {
+                    SQInteger n;
+                    _string_to_sqinteger(fmt_str + key_start, key_len, &n);
+                    arg_idx = n + 2;
+                }
+                sq_push(v, arg_idx);
+            }
+
+            sq_tostring(v, -1);
+            const SQChar* val_str;
+            sq_getstring(v, -1, &val_str);
+            SQInteger val_len = sq_getsize(v, -1);
+
+            memcpy(dest, val_str, sq_rsl(val_len));
+            dest += val_len;
+
+            sq_pop(v, (named_mode ? 2 : 1));
+            i = key_end;
+        }
+        else if(fmt_str[i] == '}')
+        {
+            if(i + 1 < fmt_len && fmt_str[i + 1] == '}')
+            { // Escaped }}
+                *dest++ = '}';
+                i++;
+                continue;
+            }
+            // This case should not be reached due to pass 1 check, but as a safeguard:
+            *dest++ = fmt_str[i];
+        }
+        else
+        {
+            *dest++ = fmt_str[i];
+        }
+    }
+
+    v->Push(SQString::Create(_ss(v), snew, total_len));
+    return 1;
+}
+
 #define STRING_TOFUNCZ(func) static SQInteger string_##func(HSQUIRRELVM v) \
 {\
     SQInteger sidx,eidx; \
@@ -996,6 +2125,24 @@ const SQRegFunction SQSharedState::_string_default_delegate_funcz[]={
     {_SC("tolower"),string_tolower,-1, _SC("s n n")},
     {_SC("toupper"),string_toupper,-1, _SC("s n n")},
     {_SC("weakref"),obj_delegate_weakref,1, NULL },
+    {_SC("split"), string_split, -2, _SC("s s|n n")},
+    {_SC("startswith"), string_startswith, 2, _SC("ss")},
+    {_SC("endswith"), string_endswith, 2, _SC("ss")},
+    {_SC("isalnum"), string_isalnum, 1, _SC("s")},
+    {_SC("islower"), string_islower, 1, _SC("s")},
+    {_SC("isupper"), string_isupper, 1, _SC("s")},
+    {_SC("isnumeric"), string_isnumeric, 1, _SC("s")},
+    {_SC("isspace"), string_isspace, 1, _SC("s")},
+    {_SC("strip"), string_strip, -1, _SC("s s")},
+    {_SC("lstrip"), string_lstrip, -1, _SC("s s")},
+    {_SC("rstrip"), string_rstrip, -1, _SC("s s")},
+    {_SC("removeprefix"), string_removeprefix, 2, _SC("ss")},
+    {_SC("removesuffix"), string_removesuffix, 2, _SC("ss")},
+    {_SC("rfind"), string_rfind, 2, _SC("ss")},
+    {_SC("zfill"), string_zfill, 2, _SC("sn")},
+    {_SC("replace"), string_replace, -3, _SC("sssn")},
+    {_SC("join"), string_join, 2, _SC("sa")},
+    {_SC("format"), string_format, -1, _SC("s.")},
     {NULL,(SQFUNCTION)0,0,NULL}
 };
 
